@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<title>Foto 360 • 36 Checkpoints (iPhone)</title>
+<style>
+  :root{color-scheme:light dark}
+  body{font-family:-apple-system,system-ui,Segoe UI,Roboto,Arial;margin:0;padding:16px;background:#f6f6f6;color:#111}
+  h3{margin:0 0 8px}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+  button{border:0;border-radius:12px;padding:12px 14px;background:#111;color:#fff;font-weight:600}
+  button.secondary{background:#eee;color:#111}
+  #preview{width:100%;max-height:48vh;background:#000;border-radius:12px}
+  #stitch{width:100%;background:#000;border-radius:12px;margin-top:8px}
+  .hint{font-size:12px;opacity:.85}
+  .ok{color:#0a8}.warn{color:#b80}.err{color:#d33}
+  .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:6px;margin:10px 0}
+  .dot{height:14px;border-radius:999px;background:#ddd;position:relative}
+  .dot.done{background:#16a34a}
+  .dot.active{outline:2px solid #2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+  .dot::after{content:attr(data-ang) "°";position:absolute;top:18px;left:50%;transform:translateX(-50%);font-size:10px;opacity:.6}
+  .panel{display:flex;justify-content:space-between;align-items:center;gap:10px}
+  .badge{padding:4px 8px;border-radius:999px;background:#eef;font-size:12px}
+</style>
+</head>
+<body>
+<h3>Foto 360 • 36 checkpoints (10°)</h3>
+<div class="hint">HTTPS + Safari. Mantenha o iPhone <b>na horizontal</b>. Gire o corpo devagar seguindo os pontos.</div>
+
+<div class="row">
+  <button id="askPerms">1) Permitir giroscópio</button>
+  <button id="startCam">2) Abrir câmera</button>
+  <button id="calibrate">3) Calibrar 0°</button>
+  <button id="startSeq">4) Iniciar (auto 10°)</button>
+  <button id="manualShot" class="secondary">Capturar MANUAL (ponto atual)</button>
+  <button id="finishSeq" class="secondary">Finalizar & Exportar</button>
+</div>
+
+<div class="panel">
+  <div id="status" class="hint">Pronto.</div>
+  <div>
+    <span class="badge" id="yawHud">Yaw: —°</span>
+    <span class="badge" id="targetHud">Meta: —°</span>
+    <span class="badge" id="countHud">0/36</span>
+  </div>
+</div>
+
+<div id="dots" class="grid"></div>
+
+<video id="preview" autoplay playsinline muted></video>
+<canvas id="stitch" width="4096" height="2048"></canvas>
+<br>
+<a id="download" download="foto-360.jpg"><button>Baixar JPEG 2:1</button></a>
+
+<script>
+(function(){
+  const NPTS = 36;            // 0..350, passo 10°
+  const STEP = 10;
+  const TOL  = 4;             // janela ±4°
+  const preview = document.getElementById('preview');
+  const stitch  = document.getElementById('stitch');
+  const ctx     = stitch.getContext('2d');
+  const statusEl= document.getElementById('status');
+  const yawHud  = document.getElementById('yawHud');
+  const targetHud= document.getElementById('targetHud');
+  const countHud= document.getElementById('countHud');
+  const download= document.getElementById('download');
+  const dotsEl  = document.getElementById('dots');
+
+  // UI dots
+  let dots = [];
+  function buildDots(){
+    dotsEl.innerHTML='';
+    dots = [];
+    for(let i=0;i<NPTS;i++){
+      const d=document.createElement('div');
+      d.className='dot';
+      d.dataset.ang=(i*STEP).toString();
+      dotsEl.appendChild(d);
+      dots.push(d);
+    }
+  }
+  buildDots();
+
+  function info(msg, cls=''){ statusEl.textContent = msg; statusEl.className = 'hint ' + cls; }
+  function norm(a){ if(a==null) return null; a%=360; if(a<0)a+=360; return a; }
+  function diff(a,b){ let d=Math.abs(a-b)%360; return d>180?360-d:d; }
+  function relAngle(yaw){ // relativo ao yaw0
+    if (yaw0==null || yaw==null) return null;
+    let r = yaw - yaw0;
+    r = r%360; if(r<0) r+=360; 
+    return r;
+  }
+  function nearestIndexFromRel(rel){
+    // quantiza para múltiplos de 10°
+    return Math.round(rel / STEP) % NPTS;
+  }
+
+  let stream=null, capturing=false, haveOrientation=false;
+  let yaw0=null, lastRel=null;
+  let targets = Array.from({length:NPTS}, (_,i)=>i*STEP); // [0,10,...,350]
+  let nextIdx = 0;                    // próximo índice alvo
+  let frames = new Array(NPTS).fill(null);   // ImageData por índice
+  let captured = 0;
+
+  // canvas temporário
+  const tcv = document.createElement('canvas');
+  const ttx = tcv.getContext('2d', { willReadFrequently: true });
+
+  async function askGyro(){
+    try{
+      if (typeof DeviceOrientationEvent!=='undefined' &&
+          typeof DeviceOrientationEvent.requestPermission==='function'){
+        const r = await DeviceOrientationEvent.requestPermission();
+        haveOrientation = (r === 'granted');
+        info(haveOrientation?'Giroscópio liberado.':'Negado (pode usar captura manual).', haveOrientation?'ok':'warn');
+      }else{ haveOrientation=true; info('Giroscópio disponível.', 'ok'); }
+    }catch{ haveOrientation=false; info('Falha no giroscópio. Use captura manual.', 'warn'); }
+  }
+
+  async function startCam(){
+    try{
+      preview.muted=true;
+      stream=await navigator.mediaDevices.getUserMedia({
+        video:{facingMode:'environment',width:{ideal:1920},height:{ideal:1080}},
+        audio:false
+      });
+      preview.srcObject=stream;
+      if(preview.readyState<2) await new Promise(r=>preview.addEventListener('loadedmetadata',r,{once:true}));
+      await preview.play();
+      info('Câmera aberta. Calibre o 0° e depois Iniciar.', 'ok');
+    }catch(e){ console.error(e); info('Erro ao abrir câmera. HTTPS + permitir em Ajustes > Safari > Câmera.', 'err'); }
+  }
+
+  function captureStrip(){
+    const vw=preview.videoWidth, vh=preview.videoHeight;
+    if(!vw||!vh){ info('Vídeo carregando…', 'warn'); return null; }
+    tcv.width=vw; tcv.height=vh;
+    ttx.drawImage(preview,0,0,vw,vh);
+    const cropH=Math.floor(vh*0.60), cropY=Math.floor((vh-cropH)/2);
+    try{ return ttx.getImageData(0,cropY,vw,cropH); }
+    catch{ info('Falha ao ler quadro da câmera.', 'err'); return null; }
+  }
+
+  function calibrate0(){
+    yaw0 = lastYawAbs; // define 0° relativo
+    nextIdx = 0;
+    highlightDots();
+    info('0° calibrado. Inicie e gire até o ponto acender em azul (±4°).', 'ok');
+  }
+
+  function highlightDots(){
+    dots.forEach((d,i)=>{
+      d.classList.toggle('done', !!frames[i]);
+      d.classList.toggle('active', i===nextIdx && !frames[i]);
+    });
+    captured = frames.reduce((a,b)=>a+(!!b),0);
+    countHud.textContent = `${captured}/${NPTS}`;
+    targetHud.textContent = `Meta: ${targets[nextIdx]}°`;
+  }
+
+  function startSeq(){
+    if(!stream){ info('Abra a câmera primeiro.', 'warn'); return; }
+    if(!haveOrientation){ info('Giroscópio não liberado – você pode capturar MANUAL a cada 10° que girar.', 'warn'); }
+    if(yaw0==null){ info('Calibre 0° antes (botão Calibrar).', 'warn'); return; }
+
+    capturing = true;
+    info('Capturando: alinhe com cada meta (±4°).', 'ok');
+    highlightDots();
+  }
+
+  function manualShot(){
+    if(!capturing){ info('Inicie primeiro.', 'warn'); return; }
+    if(frames[nextIdx]){ // já feito: busque próximo vazio
+      nextIdx = frames.findIndex(x=>!x);
+      if(nextIdx===-1){ info('Todos os 36 pontos feitos.', 'ok'); return; }
+    }
+    const img = captureStrip();
+    if(!img) return;
+    frames[nextIdx] = img;
+    // avança para o próximo alvo não capturado
+    do { nextIdx = (nextIdx+1) % NPTS; } while(frames[nextIdx] && frames.some(x=>!x));
+    highlightDots();
+  }
+
+  function finishSeq(){
+    capturing=false;
+    renderStitch();
+  }
+
+  function renderStitch(){
+    // monta em ordem crescente de ângulo (0°,10°,...)
+    const order = targets.map((ang,idx)=>({ang,idx})).sort((a,b)=>a.ang-b.ang);
+    const valid = order.filter(o=>!!frames[o.idx]);
+    if(valid.length<6){ info('Poucos pontos capturados. Faça pelo menos 6.', 'warn'); return; }
+
+    const W=4096,H=2048;
+    stitch.width=W; stitch.height=H;
+    ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+
+    const n=valid.length;
+    const sliceW=Math.ceil(W/n), sliceH=Math.floor(H*0.5), yOffset=Math.floor((H-sliceH)/2);
+
+    valid.forEach((o,i)=>{
+      const img = frames[o.idx];
+      const buf = document.createElement('canvas'), bctx = buf.getContext('2d');
+      buf.width=img.width; buf.height=img.height;
+      bctx.putImageData(img,0,0);
+      ctx.drawImage(buf,0,0,img.width,img.height, i*sliceW, yOffset, sliceW, sliceH);
+    });
+
+    stitch.toBlob(b=>{
+      if(b){ download.href = URL.createObjectURL(b); info(`Pronto. Capturados: ${valid.length}/36. Baixe o JPEG 2:1.`, 'ok'); }
+      else{ info('Falha ao gerar JPEG.', 'err'); }
+    }, 'image/jpeg', 0.92);
+  }
+
+  // --- Eventos de interface ---
+  document.getElementById('askPerms').onclick = askGyro;
+  document.getElementById('startCam').onclick = startCam;
+  document.getElementById('calibrate').onclick = calibrate0;
+  document.getElementById('startSeq').onclick = startSeq;
+  document.getElementById('manualShot').onclick = manualShot;
+  document.getElementById('finishSeq').onclick = finishSeq;
+
+  // --- Device orientation ---
+  let lastYawAbs = null;
+  window.addEventListener('deviceorientation', ev=>{
+    const yawAbs = norm(ev.alpha);
+    if(yawAbs==null){ yawHud.textContent='Yaw: —°'; return; }
+    lastYawAbs = yawAbs;
+    yawHud.textContent = `Yaw: ${yawAbs.toFixed(1)}°`;
+
+    if(!capturing || !haveOrientation || yaw0==null) return;
+
+    const rel = relAngle(yawAbs); // 0..360
+    if(rel==null) return;
+    lastRel = rel;
+
+    // se já temos frame no nextIdx, busque próximo vazio
+    if(frames[nextIdx]) {
+      const next = frames.findIndex(x=>!x);
+      if(next!==-1) nextIdx = next;
+    }
+
+    highlightDots();
+
+    const target = targets[nextIdx];
+    // checa janela ±TOL
+    const d = diff(rel, target);
+    if(d <= TOL && !frames[nextIdx]){
+      const img = captureStrip();
+      if(!img) return;
+      frames[nextIdx] = img;
+      highlightDots();
+      // avança para próximo alvo não feito
+      let tries=0;
+      do {
+        nextIdx = (nextIdx+1) % NPTS;
+        tries++;
+      } while(frames[nextIdx] && tries < NPTS);
+      highlightDots();
+    }
+  }, true);
+
+})();
+</script>
+</body>
+</html>
